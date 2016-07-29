@@ -1,5 +1,3 @@
-import logging
-import sys
 from Queue import Queue
 from threading import Thread
 
@@ -7,38 +5,6 @@ import datetime
 from SinkNode.Reader import SerialReader
 from matplotlib import pyplot as plt
 import numpy as np
-
-# # Serial grabber
-# draw_queue = Queue()
-# reader = SerialReader.SerialReader(port="COM13", baud_rate=115200, start_delimiter='!', outbox=draw_queue, logger_level=logging.INFO)
-# reader.start()
-#
-# # Graphing parameters
-# cmap = 'inferno'
-# zvals = np.zeros((4, 16))
-#
-# fig = plt.figure()
-# ax = fig.add_subplot(111)
-# img = ax.imshow(zvals, interpolation='nearest', cmap=cmap, vmin=20, vmax=32)
-# fig.show()
-#
-# while True:
-#     try:
-#         frame = draw_queue.get()
-#         zvals = np.array([frame["row0"][::-1], frame["row1"][::-1], frame["row2"][::-1], frame["row3"][::-1]])
-#         draw_queue.task_done()
-#
-#         img.set_data(zvals)
-#         fig.canvas.flush_events()
-#         fig.canvas.draw()
-#
-#     except KeyboardInterrupt:
-#         sys.exit()
-
-
-
-class Pixel(object):
-    pass
 
 
 class MLX90621:
@@ -231,8 +197,6 @@ class MLX90621:
 
         def add_pixel(self, pixel):
             self.pixels.append(pixel)
-
-
 
 
 if __name__ == '__main__':
