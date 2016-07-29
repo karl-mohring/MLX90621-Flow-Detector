@@ -8,7 +8,10 @@ __pycache__/
 
 # IDE
 .idea/
-.pioenvs/
+.pioenvs
+.clang_complete
+.gcc-flags.json
+
 
 # Distribution / packaging
 .Python
