@@ -48,9 +48,12 @@ class Blob:
         :return: None
         """
         self.pixels = []
-        self.uniformity = 0
-        self.size = 0
+        self.min = [None, None]
+        self.max = [None, None]
+        self.area = 0
         self.centroid = 0
+        self.aspect_ratio = 0
+        self.average_temperature = 0
 
     def add_pixel(self, pixel):
         """
@@ -60,9 +63,26 @@ class Blob:
         :param pixel: Pixel to be added to the blob
         :return: None
         """
+
+        if len(self.pixels):
+            self.min = [pixel.x, pixel.y]
+            self.max = [pixel.x, pixel.y]
+
+        else:
+            if pixel.x > self.max[0]:
+                self.max[0] = pixel.x
+            if pixel.x < self.min[0]:
+                self.min[0] = pixel.x
+            if pixel.y > self.max[1]:
+                self.max[1] = pixel.y
+            if pixel.y < self.min[1]:
+                self.min[1] = pixel.y
+
         self.pixels.append(pixel)
-        self.size = len(self.pixels)
+        self.area = len(self.pixels)
+        self.average_temperature = (self.average_temperature * (self.area - 1) + pixel.temperature)/self.area
         self._recalculate_centroid()
+        self.aspect_ratio = ((self.max[0] - self.min[0]) + 1) / ((self.max[1] - self.min[1]) + 1)
 
     def _recalculate_centroid(self):
         """
@@ -78,7 +98,46 @@ class Blob:
             total_x += pixel.x
             total_y += pixel.y
 
-        self.centroid = (total_x / self.size, total_y / self.size)
+        self.centroid = (total_x / self.area, total_y / self.area)
+
+
+class TrackedBlob:
+    def __init__(self, blob):
+        self.blob = blob
+        self.predicted_position = None
+        self.travel = (0, 0)
+
+    def update_blob(self, blob):
+        movement = self.blob.centroid - blob.centroid
+        self.predicted_position = blob.centroid + movement
+        self.travel += movement
+        self.blob = blob
+
+    def get_difference_factor(self, other_blob):
+        difference_factor = 0
+
+        # Predicted position - 2x penalty
+        if self.predicted_position is not None:
+            difference_factor += abs(self.predicted_position[0] - other_blob.centroid[0]) * 2
+            difference_factor += abs(self.predicted_position[1] - other_blob.centroid[1]) * 2
+
+        # Relative Position - 1x penalty
+        difference_factor += abs(self.blob.centroid[0] - other_blob.centroid[0])
+        difference_factor += abs(self.blob.centroid[1] - other_blob.centroid[1])
+
+        # Area - 2x penalty
+        difference_factor += abs(self.blob.area - other_blob.area) * 2
+
+        # Aspect ratio - 10x penalty
+        difference_factor += abs(self.blob.aspect_ratio - other_blob.aspect_ratio) * 10
+
+        # Average temperature - 10x penalty
+        difference_factor += abs(self.blob.average_temperature - other_blob.average_temperature) * 10
+
+        # Temperature deviation - 10x penalty
+        difference_factor += abs(self.blob.deviation - other_blob.deviation) * 10
+
+        return difference_factor
 
 
 class MLX90621:
@@ -107,6 +166,9 @@ class MLX90621:
         self.pixel_std_deviations = np.zeros((4, 16))
         self.pixel_averages = np.zeros((4, 16))
         self.current_frame = np.zeros((4, 16))
+        self.distance_threshold = 30
+        self.left_passes = 0
+        self.right_passes = 0
 
         self.min_blob_size = min_blob_size
 
@@ -145,10 +207,10 @@ class MLX90621:
         :return: None
         """
 
-        last_blobs = []
-        current_blobs = []
+        tracked_blobs = []
 
         while self.is_running:
+            new_tracked_blobs = []
 
             # Get new frames as they come in
             frame = self.read_queue.get()
@@ -157,8 +219,49 @@ class MLX90621:
 
             # Process the new frame - track blobs and add the frame to the running average
             current_blobs = self.find_blobs(self.current_frame)
-            # TODO - Identify and track blobs through consecutive frames
-            last_blobs = current_blobs
+            current_blobs = self.remove_small_blobs(current_blobs)
+
+            # TODO - Extract blob processing into its own method for better readability
+            # If there are no tracked blobs, then all new blobs become tracked
+            if not len(tracked_blobs) > 0:
+                if len(current_blobs) > 0:
+                    for blob in current_blobs:
+                        new_tracked_blobs.append(TrackedBlob(blob))
+
+            # If there are tracked blobs, update them if any new blobs match. Process any leftover, non-matching blobs.
+            else:
+                if len(current_blobs) > 0:
+                    for blob in current_blobs:
+                        closest_distance = None
+                        closest_blob_index = None
+
+                        # Find out if the blob is pre-existing
+                        for x in xrange(0, len(tracked_blobs)):
+                            distance = tracked_blobs[x].get_difference_factor(blob)
+                            if closest_distance is None or distance < closest_distance:
+                                closest_blob_index = x
+                                closest_distance = distance
+
+                        # If the blob is already being tracked, update the blob and re-add to the track list
+                        if closest_distance < self.distance_threshold:
+                            blob = tracked_blobs.pop(closest_blob_index).update(blob)
+
+                        # Blobs that are not currently tracked are added to the list
+                        else:
+                            blob = TrackedBlob(blob)
+
+                        new_tracked_blobs.append(blob)
+
+                # Process old blobs that are no longer being tracked
+                if len(tracked_blobs) > 0:
+                    for blob in tracked_blobs:
+                        if blob.travel[0] > 8:
+                            self.right_passes += 1
+                        elif blob.travel[0] < -8:
+                            self.left_passes += 1
+
+            tracked_blobs = new_tracked_blobs
+
             self.add_frame_to_average(self.current_frame)
 
             # Display current frame if you're into that kind of thing
@@ -169,6 +272,10 @@ class MLX90621:
 
                 if self.save_output:
                     self.fig.savefig(datetime.datetime.now().strftime("%Y-%m-%d %H%M%S.%f ") + "mlx.jpg")
+
+    def track_blobs(self, tracked_blobs, new_blobs):
+        # TODO - Add tests for blob tracking algorithm
+        pass
 
     def stop(self):
         """
@@ -310,6 +417,10 @@ class MLX90621:
             blobs.append(current_blob)
 
         return blobs
+
+    def remove_small_blobs(self, blob_list):
+        big_blobs = [blob for blob in blob_list if blob.size > self.min_blob_size]
+        return big_blobs
 
 
 if __name__ == '__main__':
