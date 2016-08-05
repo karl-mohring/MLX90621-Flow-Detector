@@ -1,4 +1,6 @@
 # coding=utf-8
+import logging
+
 from SinkNode.Reader import SerialReader
 from Queue import Queue
 from threading import Thread
@@ -50,10 +52,12 @@ class Blob:
         self.pixels = []
         self.min = [None, None]
         self.max = [None, None]
+        self.width = 0
+        self.height = 0
         self.area = 0
-        self.centroid = 0
-        self.aspect_ratio = 0
-        self.average_temperature = 0
+        self.centroid = 0.0
+        self.aspect_ratio = 0.0
+        self.average_temperature = 0.0
 
     def add_pixel(self, pixel):
         """
@@ -64,7 +68,7 @@ class Blob:
         :return: None
         """
 
-        if len(self.pixels):
+        if len(self.pixels) < 1:
             self.min = [pixel.x, pixel.y]
             self.max = [pixel.x, pixel.y]
 
@@ -82,7 +86,9 @@ class Blob:
         self.area = len(self.pixels)
         self.average_temperature = (self.average_temperature * (self.area - 1) + pixel.temperature)/self.area
         self._recalculate_centroid()
-        self.aspect_ratio = ((self.max[0] - self.min[0]) + 1) / ((self.max[1] - self.min[1]) + 1)
+        self.width = (self.max[0] - self.min[0]) + 1
+        self.height = (self.max[1] - self.min[1]) + 1
+        self.aspect_ratio = self.width/self.height
 
     def _recalculate_centroid(self):
         """
@@ -91,8 +97,8 @@ class Blob:
         Intended for internal use
         :return: None
         """
-        total_x = 0
-        total_y = 0
+        total_x = 0.0
+        total_y = 0.0
 
         for pixel in self.pixels:
             total_x += pixel.x
@@ -103,46 +109,72 @@ class Blob:
 
 class TrackedBlob:
     def __init__(self, blob):
+        """
+        Create a new tracked blob
+        :param blob: Blob to start tracking
+        :return: Tracked blob object
+        """
         self.blob = blob
         self.predicted_position = None
         self.travel = (0, 0)
 
+    def __str__(self):
+        return "Tracked blob at {},{}. Size: {} px. Travel: {},{} px".format(self.blob.centroid[0], self.blob.centroid[1], self.blob.area, self.travel[0], self.travel[1])
+
     def update_blob(self, blob):
-        movement = self.blob.centroid - blob.centroid
-        self.predicted_position = blob.centroid + movement
-        self.travel += movement
+        """
+        Update the position and features of the currently tracked blob.
+        Travel distance of the blob is calculated in the update
+
+        :param blob: Blob to replace the current tracked blob
+        :return: None
+        """
+        movement = np.subtract(blob.centroid, self.blob.centroid)
+        self.predicted_position = np.add(blob.centroid, movement)
+        self.travel = np.add(movement, self.travel)
         self.blob = blob
 
     def get_difference_factor(self, other_blob):
-        difference_factor = 0
+        """
+        Get the degree of difference between the currently tracked blob and another blob.
+        A low difference factor means the blobs are similar and could be the same entity.
+        The difference factor should be thresholded to distinguish between the same blob across mutliple frames and
+            a new blob that does not match any existing tracked blob.
+
+        Features of the blob are weighted to give more emphasis on the blobs shape and features, rather than position.
+
+        :param other_blob: Blob used for a comparison in difference factor calculations.
+        :return:
+        """
+        difference_factor = 0.0
 
         # Predicted position - 2x penalty
         if self.predicted_position is not None:
-            difference_factor += abs(self.predicted_position[0] - other_blob.centroid[0]) * 2
-            difference_factor += abs(self.predicted_position[1] - other_blob.centroid[1]) * 2
+            difference_factor += abs(self.predicted_position[0] - other_blob.centroid[0]) * 2.0
+            difference_factor += abs(self.predicted_position[1] - other_blob.centroid[1]) * 2.0
 
-        # Relative Position - 1x penalty
-        difference_factor += abs(self.blob.centroid[0] - other_blob.centroid[0])
-        difference_factor += abs(self.blob.centroid[1] - other_blob.centroid[1])
+        else:
+            # Relative Position - 1x penalty
+            difference_factor += abs(float(self.blob.centroid[0] - other_blob.centroid[0]))
+            difference_factor += abs(self.blob.centroid[1] - other_blob.centroid[1])
 
         # Area - 2x penalty
-        difference_factor += abs(self.blob.area - other_blob.area) * 2
+        difference_factor += abs(self.blob.area - other_blob.area) * 1.0
 
         # Aspect ratio - 10x penalty
-        difference_factor += abs(self.blob.aspect_ratio - other_blob.aspect_ratio) * 10
+        difference_factor += abs(self.blob.aspect_ratio - other_blob.aspect_ratio) * 10.0
 
         # Average temperature - 10x penalty
-        difference_factor += abs(self.blob.average_temperature - other_blob.average_temperature) * 10
-
-        # Temperature deviation - 10x penalty
-        difference_factor += abs(self.blob.deviation - other_blob.deviation) * 10
+        difference_factor += float(abs(float(self.blob.average_temperature) - float(other_blob.average_temperature))) * 10.0
 
         return difference_factor
 
 
 class MLX90621:
+    LOGGER_FORMAT = "%(asctime)s - %(name)s - %(levelname)s: %(message)s"
+
     def __init__(self, reader=SerialReader.SerialReader(port='COM14', baud_rate=115200, start_delimiter='!'),
-                 min_blob_size=0, running_average_size=50, colormap=None):
+                 min_blob_size=0, running_average_size=100, colormap=None, log_level=logging.WARNING):
         """
         Create an image processing object for the MLX90621 IR thermopile array sensor.
 
@@ -153,6 +185,12 @@ class MLX90621:
         :param colormap: Colour map used to graph the thermal array. default: None (but 'inferno' looks nice)
         :return: MLX90621 sensor processor object
         """
+        self.logger = logging.getLogger(__name__)
+        log_handler = logging.StreamHandler()
+        log_handler.setFormatter(logging.Formatter(self.LOGGER_FORMAT))
+        self.logger.addHandler(log_handler)
+        self.logger.setLevel(log_level)
+        self.logger.debug("MLX90621 tracking object created")
 
         # Set up incoming data cache
         self.read_queue = Queue()
@@ -166,9 +204,11 @@ class MLX90621:
         self.pixel_std_deviations = np.zeros((4, 16))
         self.pixel_averages = np.zeros((4, 16))
         self.current_frame = np.zeros((4, 16))
-        self.distance_threshold = 30
+        self.distance_threshold = 40
         self.left_passes = 0
         self.right_passes = 0
+        self.leftward_travel_direction = True
+        self.net_passes = 0
 
         self.min_blob_size = min_blob_size
 
@@ -198,6 +238,7 @@ class MLX90621:
         self.is_running = True
         self.reader.start()
         self.read_thread.start()
+        self.logger.info("Starting...")
 
     def _read_loop(self):
         """
@@ -210,59 +251,34 @@ class MLX90621:
         tracked_blobs = []
 
         while self.is_running:
-            new_tracked_blobs = []
-
             # Get new frames as they come in
             frame = self.read_queue.get()
+            self.logger.debug("Received frame")
             self.current_frame = np.array([frame["row0"][::-1], frame["row1"][::-1], frame["row2"][::-1], frame["row3"][::-1]])
             self.read_queue.task_done()
 
-            # Process the new frame - track blobs and add the frame to the running average
-            current_blobs = self.find_blobs(self.current_frame)
-            current_blobs = self.remove_small_blobs(current_blobs)
+            # Let the running average build before tracking starts
+            add_to_average = True
+            if self.running_average is not None and len(self.running_average.shape) > 2:
+                if self.running_average.shape[2] >= self.running_average_size:
+                    # Process the new frame - track blobs and add the frame to the running average
+                    current_blobs = self.find_blobs(self.current_frame)
+                    current_blobs = self.remove_small_blobs(current_blobs)
 
-            # TODO - Extract blob processing into its own method for better readability
-            # If there are no tracked blobs, then all new blobs become tracked
-            if not len(tracked_blobs) > 0:
-                if len(current_blobs) > 0:
-                    for blob in current_blobs:
-                        new_tracked_blobs.append(TrackedBlob(blob))
+                    # Do not add the frame to the average if there are active blobs
+                    # TODO - May have to change this to a blob cooldown so persistent blobs are added after a delay
+                    num_blobs = len(current_blobs)
+                    self.logger.debug("Frame contains {} blobs".format(num_blobs))
+                    if num_blobs:
+                        add_to_average = False
 
-            # If there are tracked blobs, update them if any new blobs match. Process any leftover, non-matching blobs.
-            else:
-                if len(current_blobs) > 0:
-                    for blob in current_blobs:
-                        closest_distance = None
-                        closest_blob_index = None
+                    tracked_blobs = self.track_blobs(tracked_blobs, current_blobs)
 
-                        # Find out if the blob is pre-existing
-                        for x in xrange(0, len(tracked_blobs)):
-                            distance = tracked_blobs[x].get_difference_factor(blob)
-                            if closest_distance is None or distance < closest_distance:
-                                closest_blob_index = x
-                                closest_distance = distance
+                else:
+                    self.logger.info("Building background frames: {}/{}".format(self.running_average.shape[2], self.running_average_size))
 
-                        # If the blob is already being tracked, update the blob and re-add to the track list
-                        if closest_distance < self.distance_threshold:
-                            blob = tracked_blobs.pop(closest_blob_index).update(blob)
-
-                        # Blobs that are not currently tracked are added to the list
-                        else:
-                            blob = TrackedBlob(blob)
-
-                        new_tracked_blobs.append(blob)
-
-                # Process old blobs that are no longer being tracked
-                if len(tracked_blobs) > 0:
-                    for blob in tracked_blobs:
-                        if blob.travel[0] > 8:
-                            self.right_passes += 1
-                        elif blob.travel[0] < -8:
-                            self.left_passes += 1
-
-            tracked_blobs = new_tracked_blobs
-
-            self.add_frame_to_average(self.current_frame)
+            if add_to_average:
+                self.add_frame_to_average(self.current_frame)
 
             # Display current frame if you're into that kind of thing
             if self.colourmap is not None:
@@ -273,9 +289,75 @@ class MLX90621:
                 if self.save_output:
                     self.fig.savefig(datetime.datetime.now().strftime("%Y-%m-%d %H%M%S.%f ") + "mlx.jpg")
 
-    def track_blobs(self, tracked_blobs, new_blobs):
-        # TODO - Add tests for blob tracking algorithm
-        pass
+    def track_blobs(self, tracked_blobs, current_blobs):
+        new_tracked_blobs = []
+        left_passes = 0
+        right_passes = 0
+
+        # If there are no tracked blobs, then all new blobs become tracked
+        if len(tracked_blobs) == 0:
+            if len(current_blobs) > 0:
+                for blob in current_blobs:
+                    new_tracked_blobs.append(TrackedBlob(blob))
+
+        # If there are tracked blobs, update them if any new blobs match. Process any leftover, non-matching blobs.
+        else:
+            if len(current_blobs) > 0:
+                for blob in current_blobs:
+                    closest_distance = 999
+                    closest_blob_index = None
+
+                    # Find out if the blob is pre-existing
+                    for x in xrange(0, len(tracked_blobs)):
+                        distance = tracked_blobs[x].get_difference_factor(blob)
+                        if distance < closest_distance:
+                            closest_blob_index = x
+                            closest_distance = distance
+                        self.logger.debug("Distance to tracked blob {}: {}".format(x, distance))
+
+                    # If the blob is already being tracked, update the blob and re-add to the track list
+                    if closest_distance < self.distance_threshold:
+                        self.logger.debug("Blob matches tracked blob with {} difference".format(closest_distance))
+                        tracked_blob = tracked_blobs.pop(closest_blob_index)
+                        tracked_blob.update_blob(blob)
+                        blob = tracked_blob
+
+                    # Blobs that are not currently tracked are added to the list
+                    else:
+                        blob = TrackedBlob(blob)
+                        self.logger.debug("New blob detected")
+
+                    new_tracked_blobs.append(blob)
+
+            # Process old blobs that are no longer being tracked
+            if len(tracked_blobs) > 0:
+                for blob in tracked_blobs:
+                    if blob.travel[1] > 8:
+                        right_passes += 1
+                    elif blob.travel[1] < -8:
+                        left_passes += 1
+
+        self.add_left_passes(left_passes)
+        self.add_right_passes(right_passes)
+
+        return new_tracked_blobs
+
+    def add_left_passes(self, num_passes):
+        if num_passes > 0:
+            self.left_passes += num_passes
+            self.update_net_passes()
+
+    def add_right_passes(self, num_passes):
+        if num_passes > 0:
+            self.right_passes += num_passes
+            self.update_net_passes()
+
+    def update_net_passes(self):
+        if self.leftward_travel_direction:
+            self.net_passes = self.left_passes - self.right_passes
+        else:
+            self.net_passes = self.right_passes - self.left_passes
+        self.logger.info("Net movements: {} \t {} Left\t {} Right".format(self.net_passes, self.left_passes, self.right_passes))
 
     def stop(self):
         """
@@ -419,13 +501,13 @@ class MLX90621:
         return blobs
 
     def remove_small_blobs(self, blob_list):
-        big_blobs = [blob for blob in blob_list if blob.size > self.min_blob_size]
+        big_blobs = [blob for blob in blob_list if blob.area > self.min_blob_size]
         return big_blobs
 
 
 if __name__ == '__main__':
-    reader = SerialReader.SerialReader(port='COM6', baud_rate=115200, start_delimiter='!')
-    sensor = MLX90621(reader=reader, show_output=True, colormap='inferno')
+    reader = SerialReader.SerialReader(port='COM13', baud_rate=115200, start_delimiter='!')
+    sensor = MLX90621(reader=reader, colormap='inferno', log_level=logging.INFO)
     sensor.start()
     while True:
         try:

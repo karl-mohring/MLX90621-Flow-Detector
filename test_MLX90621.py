@@ -1,3 +1,4 @@
+import logging
 from unittest import TestCase
 from MLX90621 import Blob, Pixel, MLX90621
 import numpy as np
@@ -9,6 +10,14 @@ class TestMLX90621(TestCase):
     test_frame_2 = np.full((4, 16), 2)
     test_frame_3 = np.full((4, 16), 3)
     test_frame_4 = np.full((4, 16), 4)
+
+    def setUp(self):
+        log = logging.getLogger("MLX90621")
+        x = list(log.handlers)
+        for i in x:
+            log.removeHandler(i)
+            i.flush
+            i.close
 
     def test__add_weighted_frame_to_background(self):
         """
@@ -101,9 +110,9 @@ class TestMLX90621(TestCase):
 
         # Test frame - 4 active pixels against a running background of 1.5 (with 3* 0.5 std. dev threshold)
         test_frame_2 = np.array([[0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ],
-                               [0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 2, 0, 9, 0],
-                               [0, 0, 0, 0, 0, 0, 1, 2.8, 0, 0, 0, 0, 2, 0, 9, 0],
-                               [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+                                 [0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 2, 0, 9, 0],
+                                 [0, 0, 0, 0, 0, 0, 1, 2.8, 0, 0, 0, 0, 2, 0, 9, 0],
+                                 [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
         active_pixels = test_sensor.find_active_pixels(test_frame_2)
         self.assertEqual(len(active_pixels), 4)
 
@@ -144,3 +153,89 @@ class TestMLX90621(TestCase):
                 print pixel
             print("\n\n")
         self.assertEqual(len(blobs), 4)
+
+    def test_track_blobs(self):
+        test_frame0 = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        test_frame1 = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        test_frame2 = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        test_frame3 = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        test_frame4 = np.array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+                           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+
+        tracked_blobs = []
+
+        # Set up playing field
+        test_sensor = MLX90621(running_average_size=2, log_level=logging.DEBUG)
+        test_sensor.add_frame_to_average(test_frame0)
+        test_sensor.add_frame_to_average(test_frame0)
+        self.assertEqual(test_sensor.net_passes, 0)
+
+        # First frame - new blob at 1.5, 1.5
+        new_blobs = test_sensor.find_blobs(test_frame1)
+        self.assertAlmostEqual(len(new_blobs), 1)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 1)
+
+        # Second frame - blob moves to 7.5, 1.5
+        new_blobs = test_sensor.find_blobs(test_frame2)
+        self.assertAlmostEqual(len(new_blobs), 1)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 1)
+        self.assertEqual(tracked_blobs[0].travel[1], 5)
+
+        # Third frame - blob moves to 12.5, 1.5
+        new_blobs = test_sensor.find_blobs(test_frame3)
+        self.assertAlmostEqual(len(new_blobs), 1)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 1)
+        self.assertEqual(tracked_blobs[0].travel[1], 10)
+
+        # Fourth frame - blob moves to 15, 1.5, half gone; may not recognise
+        new_blobs = test_sensor.find_blobs(test_frame4)
+        self.assertAlmostEqual(len(new_blobs), 1)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 1)
+        self.assertEqual(tracked_blobs[0].travel[1], 13.5)
+
+         # Fourth frame - blob moves to 15, 1.5, half gone; may not recognise
+        new_blobs = test_sensor.find_blobs(test_frame4)
+        self.assertAlmostEqual(len(new_blobs), 1)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 1)
+        self.assertEqual(tracked_blobs[0].travel[1], 13.5)
+
+        # Back to zero frame - Blob should now count as a rightward pass
+        self.assertEqual(test_sensor.right_passes, 0)
+        new_blobs = test_sensor.find_blobs(test_frame0)
+        self.assertEqual(len(new_blobs), 0)
+        tracked_blobs = test_sensor.track_blobs(tracked_blobs, new_blobs)
+        self.assertEqual(len(tracked_blobs), 0)
+        self.assertEqual(test_sensor.right_passes, 1)
+
+
+
+
+
+
+
+
+
+
