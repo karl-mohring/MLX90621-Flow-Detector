@@ -1,5 +1,8 @@
 # coding=utf-8
 import logging
+import sys, os
+
+sys.path.append(os.getcwd() + "/lib")
 
 from SinkNode.Reader import SerialReader
 from Queue import Queue
@@ -84,11 +87,11 @@ class Blob:
 
         self.pixels.append(pixel)
         self.area = len(self.pixels)
-        self.average_temperature = (self.average_temperature * (self.area - 1) + pixel.temperature)/self.area
+        self.average_temperature = (self.average_temperature * (self.area - 1) + pixel.temperature) / self.area
         self._recalculate_centroid()
         self.width = (self.max[0] - self.min[0]) + 1
         self.height = (self.max[1] - self.min[1]) + 1
-        self.aspect_ratio = self.width/self.height
+        self.aspect_ratio = self.width / self.height
 
     def _recalculate_centroid(self):
         """
@@ -119,7 +122,9 @@ class TrackedBlob:
         self.travel = (0, 0)
 
     def __str__(self):
-        return "Tracked blob at {},{}. Size: {} px. Travel: {},{} px".format(self.blob.centroid[0], self.blob.centroid[1], self.blob.area, self.travel[0], self.travel[1])
+        return "Tracked blob at {},{}. Size: {} px. Travel: {},{} px".format(self.blob.centroid[0],
+                                                                             self.blob.centroid[1], self.blob.area,
+                                                                             self.travel[0], self.travel[1])
 
     def update_blob(self, blob):
         """
@@ -165,7 +170,8 @@ class TrackedBlob:
         difference_factor += abs(self.blob.aspect_ratio - other_blob.aspect_ratio) * 10.0
 
         # Average temperature - 10x penalty
-        difference_factor += float(abs(float(self.blob.average_temperature) - float(other_blob.average_temperature))) * 10.0
+        difference_factor += float(
+                abs(float(self.blob.average_temperature) - float(other_blob.average_temperature))) * 10.0
 
         return difference_factor
 
@@ -174,7 +180,12 @@ class MLX90621:
     LOGGER_FORMAT = "%(asctime)s - %(name)s - %(levelname)s: %(message)s"
 
     def __init__(self, reader=SerialReader.SerialReader(port='COM14', baud_rate=115200, start_delimiter='!'),
-                 min_blob_size=0, running_average_size=100, colormap=None, log_level=logging.WARNING):
+                 mode='fast',
+                 min_blob_size=0,
+                 running_average_size=100,
+                 colormap=None,
+                 log_level=logging.WARNING,
+                 max_distance_threshold=40):
         """
         Create an image processing object for the MLX90621 IR thermopile array sensor.
 
@@ -196,24 +207,23 @@ class MLX90621:
         self.read_queue = Queue()
         self.reader = reader
         self.reader.set_outbox(self.read_queue)
+        self.read_thread = Thread(target=self._read_loop)
+        self.is_running = False
 
         # Runtime variables
-        self.current_average_size = 1  # TODO - Possible redundant variable; get rid of it?
+        self.mode = mode
         self.running_average_size = running_average_size
         self.running_average = None
-        self.pixel_std_deviations = np.zeros((4, 16))
+        self.pixel_variance = np.zeros((4, 16))
         self.pixel_averages = np.zeros((4, 16))
-        self.current_frame = np.zeros((4, 16))
-        self.distance_threshold = 40
         self.left_passes = 0
         self.right_passes = 0
         self.leftward_travel_direction = True
         self.net_passes = 0
 
+        self.distance_threshold = max_distance_threshold
         self.min_blob_size = min_blob_size
-
-        self.read_thread = Thread(target=self._read_loop)
-        self.is_running = False
+        self.background_frame_delay = self.running_average_size # Number of frames that need to pass before 'active' frames are added to the background
 
         # Display variables
         self.colourmap = colormap
@@ -224,7 +234,7 @@ class MLX90621:
             self.fig = plt.figure()
             self.ax = self.fig.add_subplot(111)
             self.ax.axis("off")
-            self.img = self.ax.imshow(self.current_frame, interpolation='nearest', cmap=self.colourmap,
+            self.img = self.ax.imshow(np.zeros((4, 16)), interpolation='nearest', cmap=self.colourmap,
                                       vmin=self.min_display_value, vmax=self.max_display_value)
             plt.colorbar(self.img)
             self.fig.show()
@@ -237,6 +247,12 @@ class MLX90621:
         """
         self.is_running = True
         self.reader.start()
+
+        if self.mode == "fast":
+            self.build_background_fast()
+        else:
+            self.build_background_slow()
+
         self.read_thread.start()
         self.logger.info("Starting...")
 
@@ -249,45 +265,62 @@ class MLX90621:
         """
 
         tracked_blobs = []
+        last_blobs = 0
+        num_consecutive_active_frames = 0
 
         while self.is_running:
             # Get new frames as they come in
-            frame = self.read_queue.get()
-            self.logger.debug("Received frame")
-            self.current_frame = np.array([frame["row0"][::-1], frame["row1"][::-1], frame["row2"][::-1], frame["row3"][::-1]])
-            self.read_queue.task_done()
+            current_frame = self.get_frame()
 
             # Let the running average build before tracking starts
             add_to_average = True
-            if self.running_average is not None and len(self.running_average.shape) > 2:
-                if self.running_average.shape[2] >= self.running_average_size:
-                    # Process the new frame - track blobs and add the frame to the running average
-                    current_blobs = self.find_blobs(self.current_frame)
-                    current_blobs = self.remove_small_blobs(current_blobs)
 
-                    # Do not add the frame to the average if there are active blobs
-                    # TODO - May have to change this to a blob cooldown so persistent blobs are added after a delay
-                    num_blobs = len(current_blobs)
-                    self.logger.debug("Frame contains {} blobs".format(num_blobs))
-                    if num_blobs:
-                        add_to_average = False
+            # Process the new frame - track blobs and add the frame to the running average
+            current_blobs = self.find_blobs(current_frame)
+            current_blobs = self.remove_small_blobs(current_blobs)
+            num_blobs = len(current_blobs)
+            self.logger.debug("Frame contains {} blobs".format(num_blobs))
 
-                    tracked_blobs = self.track_blobs(tracked_blobs, current_blobs)
+            # Do not add the frame to the average if there are active blobs
+            # TODO - May have to change this to a blob cooldown so persistent blobs are added after a delay
+            if num_blobs:
+                tracked_blobs = self.track_blobs(tracked_blobs, current_blobs)
+                add_to_average = False
+
+                if num_blobs == last_blobs:
+                    num_consecutive_active_frames += 1
+
+                    if num_consecutive_active_frames >= self.background_frame_delay:
+                        add_to_average = True
 
                 else:
-                    self.logger.info("Building background frames: {}/{}".format(self.running_average.shape[2], self.running_average_size))
+                    num_consecutive_active_frames = 0
+
+
+
+
+            last_blobs = num_blobs
 
             if add_to_average:
-                self.add_frame_to_average(self.current_frame)
+                if self.mode == "fast":
+                    self.add_weighted_frame_to_background(current_frame)
+                else:
+                    self.add_frame_to_average(current_frame)
 
             # Display current frame if you're into that kind of thing
             if self.colourmap is not None:
-                self.img.set_data(self.current_frame)
+                self.img.set_data(current_frame)
                 self.fig.canvas.flush_events()
                 self.fig.canvas.draw()
 
                 if self.save_output:
                     self.fig.savefig(datetime.datetime.now().strftime("%Y-%m-%d %H%M%S.%f ") + "mlx.jpg")
+
+    def get_frame(self):
+        frame = self.read_queue.get()
+        ordered_frame = np.array([frame["row0"][::-1], frame["row1"][::-1], frame["row2"][::-1], frame["row3"][::-1]])
+        self.read_queue.task_done()
+        return ordered_frame
 
     def track_blobs(self, tracked_blobs, current_blobs):
         new_tracked_blobs = []
@@ -357,7 +390,8 @@ class MLX90621:
             self.net_passes = self.left_passes - self.right_passes
         else:
             self.net_passes = self.right_passes - self.left_passes
-        self.logger.info("Net movements: {} \t {} Left\t {} Right".format(self.net_passes, self.left_passes, self.right_passes))
+        self.logger.info(
+                "Net movements: {} \t {} Left\t {} Right".format(self.net_passes, self.left_passes, self.right_passes))
 
     def stop(self):
         """
@@ -368,7 +402,7 @@ class MLX90621:
         self.is_running = False
         self.reader.stop()
 
-    def _add_weighted_frame_to_background(self, frame):
+    def add_weighted_frame_to_background(self, frame, average_weight=1, variance_weight=2):
         """
         Add a frame to the background image.
         Active pixels that only appear for the short term are averaged out.
@@ -376,27 +410,51 @@ class MLX90621:
         The impact of the running average is defined in 'running_average_size' (default: 50)
         This means that each new frame added to the background has a weighting of 1/50.
 
-        Until the 'running_average_size' number of frames has been added, the weighting of the frame is inversely
-        proportional to the number of frames averaged.
-            e.g: The second frame is worth 1/2, third frame is worth 1/3, and so on...
-                ...49th frame is worth 1/49, 50th+ frame is worth 1/50
-
         :param frame: New frame to add to the background
         :return: None
         """
+        # Add the frame as a weighted average
+        self.pixel_averages = (self.pixel_averages * (
+            self.running_average_size - average_weight) + frame * average_weight) \
+                              / self.running_average_size
 
-        # TODO - This method may be redundant because the running average calculations are more useful
-        # If this is the first frame, just replace the average with the frame
-        if self.current_average_size == 1:
-            self.pixel_averages = frame
+        # Add the variance of the frame as a weighted average
+        incremental_variance = (frame - self.pixel_averages)
+        incremental_variance = np.sqrt(incremental_variance * incremental_variance)
+        self.pixel_variance = (self.pixel_variance * (
+            self.running_average_size - variance_weight) + incremental_variance * variance_weight) \
+                              / self.running_average_size
 
-        else:
-            self.pixel_averages = (self.pixel_averages * (
-                self.current_average_size - 1) + frame) / self.current_average_size
+    def build_background_fast(self):
+        num_background_frames = 1
 
-        # Keep increasing the average each time until it hits the limit
-        if self.current_average_size < self.running_average_size:
-            self.current_average_size += 1
+        while self.is_running and num_background_frames <= self.running_average_size:
+            frame = self.get_frame()
+            last_averages = self.pixel_averages.copy()
+
+            # Calculate means incrementally
+            self.pixel_averages = self.pixel_averages + (frame - self.pixel_averages) / num_background_frames
+
+            # Calculate variance incrementally
+            self.pixel_variance = self.pixel_variance + (frame - self.pixel_averages) * (frame - last_averages)
+
+            num_background_frames += 1
+            self.logger.debug("Frames: {}/{}\tAvg. Temp: {}°C\tStd. Dev: {}°C".format(num_background_frames,
+                                                                                      self.running_average_size,
+                                                                                      np.average(self.pixel_averages),
+                                                                                      np.average(np.sqrt((self.pixel_variance/(num_background_frames-1))))))
+
+        self.pixel_variance = np.sqrt(self.pixel_variance / (num_background_frames - 1))
+
+    def build_background_slow(self):
+        building = True
+
+        while building:
+            frame = self.get_frame()
+            if self.running_average is not None and len(self.running_average.shape) > 2:
+                    if self.running_average.shape[2] >= self.running_average_size:
+                        building = False
+            self.add_frame_to_average(frame)
 
     def add_frame_to_average(self, frame):
         """
@@ -404,7 +462,7 @@ class MLX90621:
         Up to 'running_average_size' frames are included in the calculations with the oldest frames removed when
             new frames are added in.
         The running average of each pixel is stored in the 'pixel_averages' array, while the standard deviations of each
-            pixel are stored in 'pixel_std_deviations'.
+            pixel are stored in 'pixel_variance'.
         This method is the true way of calculating the running average, as opposed to using a weighted average
         :param frame: Frame to be added to the calculations
         :return: None
@@ -423,7 +481,7 @@ class MLX90621:
             # Add new frame at the end of the background array
             self.running_average = np.dstack((self.running_average, frame))
 
-            self.pixel_std_deviations = np.std(self.running_average, axis=2)
+            self.pixel_variance = np.std(self.running_average, axis=2)
             self.pixel_averages = np.average(self.running_average, axis=2)
 
     def find_active_pixels(self, frame):
@@ -442,7 +500,7 @@ class MLX90621:
 
                 # A pixel is active if it deviates from its average by 3 std deviations
                 if abs(self.pixel_averages[row][column] - frame[row][column]) > (
-                            self.pixel_std_deviations[row][column] * 3):
+                            self.pixel_variance[row][column] * 3):
                     pixel = Pixel(row, column, frame[row][column])
                     active_pixels.append(pixel)
 
@@ -506,8 +564,10 @@ class MLX90621:
 
 
 if __name__ == '__main__':
-    reader = SerialReader.SerialReader(port='COM13', baud_rate=115200, start_delimiter='!')
-    sensor = MLX90621(reader=reader, colormap='inferno', log_level=logging.INFO)
+    reader = SerialReader.SerialReader(port='COM6', baud_rate=115200, start_delimiter='!')
+    # sensor = MLX90621(reader=reader, colormap='inferno', log_level=logging.INFO, min_blob_size=6)
+    sensor = MLX90621(reader=reader, log_level=logging.DEBUG, min_blob_size=6, running_average_size=50, colormap='inferno',
+                      max_distance_threshold=60)
     sensor.start()
     while True:
         try:

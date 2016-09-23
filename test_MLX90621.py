@@ -27,14 +27,31 @@ class TestMLX90621(TestCase):
         test_sensor = MLX90621(running_average_size=4)
 
         # Test - First frames become the new average
-        test_sensor._add_weighted_frame_to_background(self.test_frame_2)
+        test_sensor.pixel_averages = self.test_frame_2
+        test_sensor.add_weighted_frame_to_background(self.test_frame_2)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, self.test_frame_2), True)
 
         # Test - averages behave as expected
-        test_sensor._add_weighted_frame_to_background(self.test_frame_0)
+        # Adding a 0 frame will result in a set of {2, 2, 2, 0}; average=1.5
+        test_sensor.add_weighted_frame_to_background(self.test_frame_0)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, self.test_frame_0), False)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, self.test_frame_2), False)
-        self.assertEqual(np.array_equal(test_sensor.pixel_averages, self.test_frame_1), True)
+        self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 1.5)), True)
+
+        # Test - averages behave as expected
+        # A second zero should result in a weighted average of 1.125
+        test_sensor.add_weighted_frame_to_background(self.test_frame_0)
+        self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 1.125)), True)
+
+        # Test - averages behave as expected
+        # A third zero should result in a weighted average of 0.84375
+        test_sensor.add_weighted_frame_to_background(self.test_frame_0)
+        self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 0.84375)), True)
+
+        # Test - averages behave as expected
+        # A third zero should result in a weighted average of 0.84375
+        test_sensor.add_weighted_frame_to_background(self.test_frame_4)
+        self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 1.6328125)), True)
 
     def test_add_frame_to_average(self):
         """
@@ -47,42 +64,42 @@ class TestMLX90621(TestCase):
         # Running frames = [0], Avg. 0, Std. 0
         test_sensor.add_frame_to_average(self.test_frame_0)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, self.test_frame_0), True)
-        self.assertEqual(np.array_equal(test_sensor.pixel_std_deviations, np.full((4, 16), 0)), True)
+        self.assertEqual(np.array_equal(test_sensor.pixel_variance, np.full((4, 16), 0)), True)
 
         # Running frames = [0, 1], Avg. 0.5, Std. 0.5
         test_sensor.add_frame_to_average(self.test_frame_1)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 0.5)), True)
-        self.assertEqual(np.array_equal(test_sensor.pixel_std_deviations, np.full((4, 16), 0.5)), True)
+        self.assertEqual(np.array_equal(test_sensor.pixel_variance, np.full((4, 16), 0.5)), True)
 
         # Running frames = [0, 1, 2], Avg. 1, Std. 0.8165
         test_sensor.add_frame_to_average(self.test_frame_2)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 1)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 0.8165)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 0.8165)), True)
 
         # Running frames = [0, 1, 2, 3], Avg. 1.5, Std. 1.11803
         test_sensor.add_frame_to_average(self.test_frame_3)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 1.5)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 1.11803)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 1.11803)), True)
 
         # Running frames = [1, 2, 3, 4], Avg. 2.5, Std. 1.11803
         test_sensor.add_frame_to_average(self.test_frame_4)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 2.5)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 1.11803)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 1.11803)), True)
 
         # Running frames = [2, 3, 4, 4], Avg. 3.25, Std. 0.82916
         test_sensor.add_frame_to_average(self.test_frame_4)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 3.25)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 0.82916)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 0.82916)), True)
 
         # Running frames = [3, 4, 4, 4], Avg. 3.75, Std. 0.43301
         test_sensor.add_frame_to_average(self.test_frame_4)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 3.75)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 0.43301)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 0.43301)), True)
 
         # Running frames = [4, 4, 4, 4], Avg. 4, Std. 0
         test_sensor.add_frame_to_average(self.test_frame_4)
         self.assertEqual(np.array_equal(test_sensor.pixel_averages, np.full((4, 16), 4)), True)
-        self.assertEqual(np.allclose(test_sensor.pixel_std_deviations, np.full((4, 16), 0)), True)
+        self.assertEqual(np.allclose(test_sensor.pixel_variance, np.full((4, 16), 0)), True)
 
     def test_find_active_pixels(self):
         """

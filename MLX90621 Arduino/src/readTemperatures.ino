@@ -20,9 +20,10 @@ void setup(){
   pinMode(D1, OUTPUT);
   digitalWrite(D1, HIGH);
   Wire.begin(D2, D3);
-  sensor.initialise (16); // start the thermo cam with 8 frames per second
+  sensor.initialise(16); // start the thermo cam with 8 frames per second
   Serial.println("sensor initialized!");
 }
+
 void loop(){
   sensor.measure(true); //get new readings from the sensor
 
