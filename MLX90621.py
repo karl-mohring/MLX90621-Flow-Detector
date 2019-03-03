@@ -218,12 +218,14 @@ class MLX90621:
         self.pixel_averages = np.zeros((4, 16))
         self.left_passes = 0
         self.right_passes = 0
+        self.zero_passes = 0
         self.leftward_travel_direction = True
         self.net_passes = 0
+        self.travel_threshold = 6
+        self.add_to_background_delay = 20
 
         self.distance_threshold = max_distance_threshold
         self.min_blob_size = min_blob_size
-        self.background_frame_delay = self.running_average_size # Number of frames that need to pass before 'active' frames are added to the background
 
         # Display variables
         self.colourmap = colormap
@@ -265,8 +267,8 @@ class MLX90621:
         """
 
         tracked_blobs = []
-        last_blobs = 0
-        num_consecutive_active_frames = 0
+        num_last_blobs = 0
+        num_unchanged_frames = 0
 
         while self.is_running:
             # Get new frames as they come in
@@ -281,25 +283,21 @@ class MLX90621:
             num_blobs = len(current_blobs)
             self.logger.debug("Frame contains {} blobs".format(num_blobs))
 
-            # Do not add the frame to the average if there are active blobs
-            # TODO - May have to change this to a blob cooldown so persistent blobs are added after a delay
+            # Do not add the frame to the average if there are active blobs...
             if num_blobs:
-                tracked_blobs = self.track_blobs(tracked_blobs, current_blobs)
                 add_to_average = False
 
-                if num_blobs == last_blobs:
-                    num_consecutive_active_frames += 1
-
-                    if num_consecutive_active_frames >= self.background_frame_delay:
-                        add_to_average = True
+                # ...but start adding active frames to the average when nothing changes for a while
+                if num_blobs == num_last_blobs:
+                    num_unchanged_frames += 1
 
                 else:
-                    num_consecutive_active_frames = 0
+                    num_unchanged_frames = 0
 
+                if num_unchanged_frames >= self.add_to_background_delay:
+                    add_to_average = True
 
-
-
-            last_blobs = num_blobs
+            tracked_blobs = self.track_blobs(tracked_blobs, current_blobs)
 
             if add_to_average:
                 if self.mode == "fast":
@@ -316,22 +314,38 @@ class MLX90621:
                 if self.save_output:
                     self.fig.savefig(datetime.datetime.now().strftime("%Y-%m-%d %H%M%S.%f ") + "mlx.jpg")
 
+            num_last_blobs = num_blobs
+
     def get_frame(self):
+        """
+        Get the next frame from the MLX90621 thermopile array
+        :return: Frame containing temperature information in an np matrix
+        """
         frame = self.read_queue.get()
         ordered_frame = np.array([frame["row0"][::-1], frame["row1"][::-1], frame["row2"][::-1], frame["row3"][::-1]])
         self.read_queue.task_done()
         return ordered_frame
 
     def track_blobs(self, tracked_blobs, current_blobs):
+        """
+        Track blobs in between frames
+        Blobs detected in the latest frame are compared to previously tracked blobs to determine if they are the same.
+
+        :param tracked_blobs: Previously tracked blobs
+        :param current_blobs: Blobs detected from the current frame.
+        :return: List of currently tracked blobs
+        """
         new_tracked_blobs = []
         left_passes = 0
         right_passes = 0
+        zero_passes = 0
 
         # If there are no tracked blobs, then all new blobs become tracked
         if len(tracked_blobs) == 0:
             if len(current_blobs) > 0:
                 for blob in current_blobs:
                     new_tracked_blobs.append(TrackedBlob(blob))
+                    self.logger.info("New tracked blob")
 
         # If there are tracked blobs, update them if any new blobs match. Process any leftover, non-matching blobs.
         else:
@@ -358,20 +372,24 @@ class MLX90621:
                     # Blobs that are not currently tracked are added to the list
                     else:
                         blob = TrackedBlob(blob)
-                        self.logger.debug("New blob detected")
+                        self.logger.info("New blob detected")
 
                     new_tracked_blobs.append(blob)
 
             # Process old blobs that are no longer being tracked
             if len(tracked_blobs) > 0:
                 for blob in tracked_blobs:
-                    if blob.travel[1] > 8:
+                    self.logger.debug("Tracked blob travelled {} pixels".format(blob.travel[1]))
+                    if blob.travel[1] > self.travel_threshold:
                         right_passes += 1
-                    elif blob.travel[1] < -8:
+                    elif blob.travel[1] < (-1 * self.travel_threshold):
                         left_passes += 1
+                    else:
+                        zero_passes += 1
 
         self.add_left_passes(left_passes)
         self.add_right_passes(right_passes)
+        self.add_zero_passes(zero_passes)
 
         return new_tracked_blobs
 
@@ -385,13 +403,17 @@ class MLX90621:
             self.right_passes += num_passes
             self.update_net_passes()
 
+    def add_zero_passes(self, num_passes):
+        if num_passes > 0:
+            self.zero_passes += num_passes
+
     def update_net_passes(self):
         if self.leftward_travel_direction:
             self.net_passes = self.left_passes - self.right_passes
         else:
             self.net_passes = self.right_passes - self.left_passes
         self.logger.info(
-                "Net movements: {} \t {} Left\t {} Right".format(self.net_passes, self.left_passes, self.right_passes))
+                "Net movements: {} \t {} Left\t {} Right\t {} Extras".format(self.net_passes, self.left_passes, self.right_passes, self.zero_passes))
 
     def stop(self):
         """
@@ -426,14 +448,21 @@ class MLX90621:
                               / self.running_average_size
 
     def build_background_fast(self):
+        """
+        Build the background frames using Welford's algorithm (one-pass)
+        The background contains the mean values for each pixel and their std deviation
+        :return: None
+        """
         num_background_frames = 1
+
+        self.logger.info("Building background")
 
         while self.is_running and num_background_frames <= self.running_average_size:
             frame = self.get_frame()
             last_averages = self.pixel_averages.copy()
 
             # Calculate means incrementally
-            self.pixel_averages = self.pixel_averages + (frame - self.pixel_averages) / num_background_frames
+            self.pixel_averages += (frame - self.pixel_averages) / num_background_frames
 
             # Calculate variance incrementally
             self.pixel_variance = self.pixel_variance + (frame - self.pixel_averages) * (frame - last_averages)
@@ -445,6 +474,7 @@ class MLX90621:
                                                                                       np.average(np.sqrt((self.pixel_variance/(num_background_frames-1))))))
 
         self.pixel_variance = np.sqrt(self.pixel_variance / (num_background_frames - 1))
+        self.logger.info("Finished building background")
 
     def build_background_slow(self):
         building = True
@@ -564,10 +594,10 @@ class MLX90621:
 
 
 if __name__ == '__main__':
-    reader = SerialReader.SerialReader(port='COM6', baud_rate=115200, start_delimiter='!')
+    reader = SerialReader.SerialReader(port='COM13', baud_rate=115200, start_delimiter='!')
     # sensor = MLX90621(reader=reader, colormap='inferno', log_level=logging.INFO, min_blob_size=6)
-    sensor = MLX90621(reader=reader, log_level=logging.DEBUG, min_blob_size=6, running_average_size=50, colormap='inferno',
-                      max_distance_threshold=60)
+    sensor = MLX90621(reader=reader, log_level=logging.DEBUG, min_blob_size=6, running_average_size=50,
+                      max_distance_threshold=50, colormap='inferno')
     sensor.start()
     while True:
         try:
